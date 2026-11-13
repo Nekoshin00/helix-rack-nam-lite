@@ -86,7 +86,14 @@ class Image:
         return struct.unpack('<I', self.rd(va, 4))[0]
 
 
-def tables(im, src_ni, new_ni, n_params, xeno_ni=None):
+def select_pids(rows, count):
+    free = sorted(set(range(1, 833)) - {r[1] for r in rows})
+    pids = [p for p in free if pa._thumb_modimm(p) is not None][:count]
+    assert len(pids) == count and pids[0] == free[0], "no compatible preset IDs"
+    return free, pids
+
+
+def tables(im, src_ni, new_ni, n_params, xeno_ni=None, extra_models=()):
     """The new Table 1, Table 2 and browser lists (upstream add_model_entry0's steps 1-3)."""
     log = []
     tab1 = im.u32(TAB1_BASE_PTRS[0])
@@ -97,33 +104,38 @@ def tables(im, src_ni, new_ni, n_params, xeno_ni=None):
         assert pa._decode_thumb_movw(im.rd(a, 4))[1] == n1 - 1
     t1 = bytearray(im.rd(tab1, 12 * n1))
     rows = [struct.unpack_from('<IHHI', t1, 12 * i) for i in range(n1)]
-    assert new_ni not in [r[0] for r in rows]
+    models = [(new_ni, DISPLAY)] + list(extra_models)
+    assert not E555 or not extra_models, "light models cannot be combined with NAM_555"
+    assert len({ni for ni, _ in models}) == len(models)
+    assert not {ni for ni, _ in models} & {r[0] for r in rows}
     src = next(r for r in rows if r[0] == src_ni)
-    free = sorted(set(range(1, 833)) - {r[1] for r in rows})
-    pid = free[0]
+    free, pids = select_pids(rows, len(models))
     if E555:                                  # Xenomorph Fuzz Mono's row leaves Table 1 (its code stays)
         assert xeno_ni is not None and (xeno_ni, XENO_PID) in [(r[0], r[1]) for r in rows], "no Xenomorph row on 555"
         t1 = bytearray(b"".join(t1[12 * i: 12 * i + 12] for i, r in enumerate(rows) if r[1] != XENO_PID))
-        pid = XENO_PID
+        pids = [XENO_PID]
         n1 -= 1
-    t1 += struct.pack('<IHHI', new_ni, pid, 0, DSP_COST)
-    log.append(f"Table 1: {n1} -> {n1 + 1} rows; NAM preset id {pid} (free: {free[:8]}...), DSP cost {DSP_COST} "
+    for (ni, _), pid in zip(models, pids):
+        t1 += struct.pack('<IHHI', ni, pid, 0, DSP_COST)
+    log.append(f"Table 1: {n1} -> {n1 + len(models)} rows; NAM preset ids {pids} (free: {free[:8]}...), DSP cost {DSP_COST} "
                f"(Clarity {src[3]})")
     tab2 = im.u32(TAB2_BASE_PTR)
     rd2, n2 = pa._decode_thumb_movw(im.rd(TAB2_CNT_INSN, 4))
     assert n2 == 823
     t2 = bytearray(im.rd(tab2, 44 * n2))
     row_ni = xeno_ni if E555 and V555 == "fx" else src_ni
-    row = bytearray(next(t2[44 * i: 44 * i + 44] for i in range(n2) if struct.unpack_from('<I', t2, 44 * i)[0] == row_ni))
-    struct.pack_into('<I', row, 0, new_ni)
-    row[4:20] = SHORT.encode('latin1')[:16].ljust(16, b'\0')
-    counts = struct.unpack_from('<3I', row, 24)
-    assert len(set(counts)) == 1
-    struct.pack_into('<3I', row, 24, n_params, n_params, n_params)
-    t2 += row
-    log.append(f"Table 2: {n2} -> {n2 + 1} rows (row from model {row_ni}: category {row[21]}, class {row[22]})")
+    source_row = bytes(next(t2[44 * i: 44 * i + 44] for i in range(n2) if struct.unpack_from('<I', t2, 44 * i)[0] == row_ni))
+    for ni, display in models:
+        row = bytearray(source_row)
+        struct.pack_into('<I', row, 0, ni)
+        row[4:20] = display.encode('latin1')[:16].ljust(16, b'\0')
+        counts = struct.unpack_from('<3I', row, 24)
+        assert len(set(counts)) == 1
+        struct.pack_into('<3I', row, 24, n_params, n_params, n_params)
+        t2 += row
+    log.append(f"Table 2: {n2} -> {n2 + len(models)} rows (row from model {row_ni}: category {row[21]}, class {row[22]})")
     dname = DISPLAY.encode('latin1')[:25].ljust(26, b'\0')
-    lists, folder_item = [], None
+    lists, folder_items = [], None
     for idx in range(pa.E0_BLIST_SLOTS):
         lp, lc = im.u32(BLIST_PTR_TAB + 4 * idx), im.u32(BLIST_CNT_TAB + 4 * idx)
         if not lp or not lc:
@@ -134,39 +146,42 @@ def tables(im, src_ni, new_ni, n_params, xeno_ni=None):
             bt, mi, ci, u12 = struct.unpack_from('<IIiH', raw, 48 * k)
             if E555 and mi == xeno_ni:
                 item = bytearray(raw[48 * k: 48 * k + 48])
-                struct.pack_into('<IIiH', item, 0, bt, new_ni, ci, pid if ci == -1 else u12)
+                struct.pack_into('<IIiH', item, 0, bt, new_ni, ci, pids[0] if ci == -1 else u12)
                 item[14:40] = dname
                 struct.pack_into('<2I', item, 40, 1, 0)
-                if folder_item is None and ci == -1 and V555 != "amp":
-                    folder_item = bytes(item)
+                if folder_items is None and ci == -1 and V555 != "amp":
+                    folder_items = bytes(item)
                 lists.append((idx, lc - 1, bytes(raw[:48 * k] + raw[48 * k + 48:])))
                 log.append(f"browser list ({idx // 4},{idx % 4}): Xenomorph item removed, {lc} -> {lc - 1} items" +
                            ("" if V555 == "amp" else f"; btype {bt} kept for the NAM item"))
                 item = None
                 break
             if (not E555 or V555 == "amp") and mi == src_ni:
-                item = bytearray(raw[48 * k: 48 * k + 48])
-                struct.pack_into('<IIiH', item, 0, bt, new_ni, ci, pid if ci == -1 else u12)
-                item[14:40] = dname
-                struct.pack_into('<2I', item, 40, 1, 0)
+                item = bytearray()
+                for (ni, display), pid in zip(models, pids):
+                    entry = bytearray(raw[48 * k: 48 * k + 48])
+                    struct.pack_into('<IIiH', entry, 0, bt, ni, ci, pid if ci == -1 else u12)
+                    entry[14:40] = display.encode('latin1')[:25].ljust(26, b'\0')
+                    struct.pack_into('<2I', entry, 40, 1, 0)
+                    item += entry
                 break
         if item is None:
             continue
         if idx // 4 == FOLDER[0]:
-            if folder_item is None and ci == -1:
-                folder_item = bytes(item)
+            if folder_items is None and ci == -1:
+                folder_items = bytes(item)
         else:
-            lists.append((idx, lc + 1, bytes(raw + item)))
-            log.append(f"browser list ({idx // 4},{idx % 4}): {lc} -> {lc + 1} items")
+            lists.append((idx, lc + len(models), bytes(raw + item)))
+            log.append(f"browser list ({idx // 4},{idx % 4}): {lc} -> {lc + len(models)} items")
     cat, fname = FOLDER
     nsub = im.u32(SUBCAT_CNT + 4 * cat)
     fb = fname.encode('latin1')[:25].ljust(26, b'\0')
     assert nsub < 4 and not im.u32(BLIST_PTR_TAB + 4 * (4 * cat + nsub))
     assert not any(im.rd(SUBCAT_NAMES + 104 * cat + 26 * nsub, 26))
-    assert folder_item is not None
-    lists.append((4 * cat + nsub, 1, folder_item))
-    log.append(f"new folder '{fname}' = subcategory {nsub} of category {cat}, 1 item")
-    return pid, (rd_cnt, n1 + 1, bytes(t1)), (rd2, n2 + 1, bytes(t2)), lists, (cat, nsub, fb), log
+    assert folder_items is not None
+    lists.append((4 * cat + nsub, len(models), folder_items))
+    log.append(f"new folder '{fname}' = subcategory {nsub} of category {cat}, {len(models)} items")
+    return pids, (rd_cnt, n1 + len(models), bytes(t1)), (rd2, n2 + len(models), bytes(t2)), lists, (cat, nsub, fb), log
 
 
 def rename(im, names):
@@ -190,11 +205,11 @@ def rename(im, names):
     return f"real names: {t2} Table 2 rows, {it} browser items renamed ({len(names)} models)"
 
 
-def build_e0(e0, src_ni, new_ni, n_params, xeno_ni=None, names=None):
+def build_e0(e0, src_ni, new_ni, n_params, xeno_ni=None, names=None, extra_models=()):
     im = Image(e0)
     name_log = rename(im, names) if names else None
     assert (im.segs[0][3], im.segs[0][2]) == SEG0, "seg0 is not the stock one"
-    pid, (rd1, c1, t1), (rd2, c2, t2), lists, (cat, nsub, fb), log = tables(im, src_ni, new_ni, n_params, xeno_ni)
+    pids, (rd1, c1, t1), (rd2, c2, t2), lists, (cat, nsub, fb), log = tables(im, src_ni, new_ni, n_params, xeno_ni, extra_models)
     if name_log:
         log.append(name_log)
     hook = arm_guards.build().assemble()
@@ -227,8 +242,8 @@ def build_e0(e0, src_ni, new_ni, n_params, xeno_ni=None, names=None):
     la = [(idx, cnt, put_old(raw)) for idx, cnt, raw in lists]
     title_base = CAVE + len(cave)
     # 555 amp: Model is knob 6, a float (ir_title knob_pids); hybrid/fx: the item is an effect, not CAT_AMP: no title
-    tcode, ca, cb = (ir_title.build(title_base, [], [pid], 6) if E555 and V555 == "amp" else
-                     ir_title.build(title_base, [] if E555 else [pid]))
+    tcode, ca, cb = (ir_title.build(title_base, [], pids, 6) if E555 and V555 == "amp" else
+                     ir_title.build(title_base, [] if E555 else pids))
     put(tcode)
     assert CAVE + len(cave) <= CAVE_END, f"cave {len(cave)} bytes, room {CAVE_END - CAVE}"
     # pointers and counts (all in seg2: the file offsets don't move with seg0's growth... they do,
@@ -268,15 +283,17 @@ def build_e0(e0, src_ni, new_ni, n_params, xeno_ni=None, names=None):
                f"{CAVE_END - CAVE - delta} bytes left); Entry 0 {len(e0):#x} -> {len(out):#x}")
     log.append(f"guards: HOOK {len(hook)} bytes at {CAVE:#x}; 0x28135070 -> ldr.w pc, [pc] ; .word {CAVE | 1:#x}")
     log.append(f"IR-name title: caves {ca:#x} / {cb:#x} ({len(tcode)} B); sites {ir_title.SITE_A:#x}, "
-               f"{ir_title.SITE_B:#x} (via relay {ir_title.RELAY:#x}) for preset id {pid}")
+               f"{ir_title.SITE_B:#x} (via relay {ir_title.RELAY:#x}) for preset ids {pids}")
     log.append(f"tables at Table 1 {a1:#x}, Table 2 {a2:#x}, lists " + ", ".join(f"({i // 4},{i % 4}) {v:#x}" for i, _, v in la))
-    return out, pid, log, (a1, a2, la, ca, cb, tcode)
+    return out, pids, log, (a1, a2, la, ca, cb, tcode)
 
 
-def verify(e0, src_ni, new_ni, addrs, xeno_ni=None):
+def verify(e0, src_ni, new_ni, addrs, xeno_ni=None, extra_models=(), pids=None):
     """Read the result back: segments chain, pointers and counts, the new rows, and the guard
     code in the cave run through the guard tests' interpreter."""
-    n_t1 = 823 if E555 else 824
+    models = [(new_ni, DISPLAY)] + list(extra_models)
+    n_t1 = 823 + len(models) - int(E555)
+    n_t2 = 823 + len(models)
     im = Image(e0)
     a1, a2, la, ca, cb, tcode = addrs
     for va, b in ir_title.site_patches(ca, cb).items():
@@ -284,16 +301,20 @@ def verify(e0, src_ni, new_ni, addrs, xeno_ni=None):
     assert im.rd(ca, len(tcode)) == tcode
     assert all(im.u32(p) == a1 for p in TAB1_BASE_PTRS)
     assert pa._decode_thumb_movw(im.rd(TAB1_CNT_INSN, 4))[1] == n_t1 and im.u32(TAB1_END_PTR) == a1 + 12 * n_t1
-    assert im.u32(TAB2_BASE_PTR) == a2 and pa._decode_thumb_movw(im.rd(TAB2_CNT_INSN, 4))[1] == 824
-    assert struct.unpack_from('<I', im.rd(a1 + 12 * (n_t1 - 1), 12))[0] == new_ni
-    assert struct.unpack_from('<I', im.rd(a2 + 44 * 823, 44))[0] == new_ni
+    assert im.u32(TAB2_BASE_PTR) == a2 and pa._decode_thumb_movw(im.rd(TAB2_CNT_INSN, 4))[1] == n_t2
+    for k, (ni, display) in enumerate(models):
+        r = struct.unpack('<IHHI', im.rd(a1 + 12 * (n_t1 - len(models) + k), 12))
+        assert r[0] == ni and r[3] == DSP_COST and (pids is None or r[1] == pids[k]), r
+        row = im.rd(a2 + 44 * (823 + k), 44)
+        assert struct.unpack_from('<I', row)[0] == ni
+        assert row[4:20] == display.encode('latin1')[:16].ljust(16, b'\0')
     for idx, cnt, va in la:
         assert im.u32(BLIST_PTR_TAB + 4 * idx) == va and im.u32(BLIST_CNT_TAB + 4 * idx) == cnt
         mis = [struct.unpack_from('<I', im.rd(va + 48 * k, 48), 4)[0] for k in range(cnt)]
         if E555:                                       # (the Distortion list lost Xenomorph; NAM is in the folder)
             assert xeno_ni not in mis and (new_ni in mis or idx // 4 == 2)
         else:
-            assert mis[-1] == new_ni
+            assert mis[-len(models):] == [ni for ni, _ in models]
     if E555:
         pids = [struct.unpack_from('<IHHI', im.rd(a1 + 12 * i, 12))[1] for i in range(n_t1)]
         assert pids.count(XENO_PID) == 1 and pids[-1] == XENO_PID
@@ -306,12 +327,24 @@ def verify(e0, src_ni, new_ni, addrs, xeno_ni=None):
 
 def main():
     src, out = sys.argv[1], sys.argv[2]
+    light = os.environ.get("NAM_LAYERS") == "1"
+    if light and (E555 or os.environ.get("NAM_555_VARIANT") or DSP_COST != 3600):
+        raise SystemExit("NAM_LAYERS requires the default uncalibrated DSP cost and no NAM_555 variants.")
     data, _ = pa.load_l6ia_from_any(src)
     db = pa.parse_entry3_full(pa.get_entry_swapped(data, E_DB))
     src_ni = pa.find_model(db, 'HD2_AmpLine6Clarity')['words'][2]
     nam = pa.find_model(db, NAME)
     assert nam['name'] == NAME, "run stage_model first"
     new_ni, n_params = nam['words'][2], len(nam['params'])
+    extra_models = []
+    if light:
+        import stage_model
+        if not getattr(stage_model.nam_rack, "LAYERS", False):
+            raise SystemExit("NAM_LAYERS requires the layer-aware kernel.")
+        for name, display, _ in stage_model.LIGHT_MODELS[1:]:
+            model = pa.find_model(db, name)
+            assert len(model['params']) == n_params, f"{name} has different parameters"
+            extra_models.append((model['words'][2], display))
     e0 = pa.get_entry_swapped(data, E_MAIN)
     assert e0 == pa.get_entry_swapped(data, E_COPY), "Entries 0 and 1 are not identical"
     xeno_ni = pa.find_model(db, XENO)['words'][2] if E555 else None
@@ -321,8 +354,10 @@ def main():
         names = {pa.find_model(db, r['internal'])['words'][2]: r['real_name']
                  for r in csv.DictReader(open(os.environ["NAM_NAMES"], encoding='utf-8'))}
         assert all(len(v) <= 16 and v.isascii() for v in names.values())
-    new0, pid, log, addrs = build_e0(e0, src_ni, new_ni, n_params, xeno_ni, names)
-    msg = verify(new0, src_ni, new_ni, addrs, xeno_ni)
+    new0, pids, log, addrs = build_e0(e0, src_ni, new_ni, n_params, xeno_ni, names, extra_models)
+    if light:
+        assert pids[0] == 380, f"original NAM preset ID changed: {pids[0]}"
+    msg = verify(new0, src_ni, new_ni, addrs, xeno_ni, extra_models, pids)
     # Entry 1 stays stock: on the Floor the app itself runs update mode ("Entered Update Mode!"),
     # so an untouched copy may be the way back if the patched one fails; it also shows which copy runs.
     img, _, _ = l6ia.rebuild_archive(data, {E_MAIN: new0})

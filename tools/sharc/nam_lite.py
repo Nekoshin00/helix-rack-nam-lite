@@ -130,9 +130,16 @@ def input_trim(dbu):
     return g if g > 0 else 1.0
 
 
-def ir_samples(w, dbu=None):
+def layer_count(w):
+    """Count active leading layers in a padded A2 Lite model."""
+    blocks, _, _, _ = layer_weights(w)
+    return max((i + 1 for i, block in enumerate(blocks) if any(block)), default=0)
+
+
+def ir_samples(w, dbu=None, include_layer_count=False):
     """The 2,048 float samples of a NAM Lite model as a User IR (tools/nam2ir.py):
-    a header (word 5 the capture's input level, level_word(dbu)), then the stream divided by 2^e (exact) so that every sample is
+    a header (word 5 the capture's input level; optionally word 7 the count of active
+    leading layers divided by 32, or zero for all 23), then the stream divided by 2^e (exact) so that every sample is
     within HX Edit's +-15.8 limit (the header too: the word count is stored
     / 1024; 1871.0 itself was refused, -8317); the rest 0 (sample 2047 = 0:
     no tail fade)."""
@@ -141,7 +148,9 @@ def ir_samples(w, dbu=None):
     e = 0
     while peak / 2.0 ** e > 15.5:
         e += 1
-    head = [0.5, -0.5, float(C), 2.0 ** e, N_WEIGHTS / 1024.0, level_word(dbu), 0.0, 0.0]
+    layers = layer_count(w) if include_layer_count else len(nam_pack.KERNEL)
+    layer_word = layers / 32.0 if 0 < layers < len(nam_pack.KERNEL) else 0.0
+    head = [0.5, -0.5, float(C), 2.0 ** e, N_WEIGHTS / 1024.0, level_word(dbu), 0.0, layer_word]
     out = head + [x / 2.0 ** e for x in st]
     assert len(out) < IR_SAMPLES
     assert max(abs(x) for x in out) < IR_LIMIT, "a sample HX Edit would refuse"

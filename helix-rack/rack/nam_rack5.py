@@ -229,6 +229,128 @@ n_hgo:
 """ + src[b:]
 
 
+# Light captures (LAYERS): a capture distilled to its first P layers is stored as a full A2 Lite whose
+# layers P..22 are all zero (bit for bit the same output: a zero layer adds exactly 0 to x and to the
+# head's sum). The converter writes P / 32 into the User IR's header word 7 (0 in every older IR: all
+# 23 layers). The load keeps 23 - P in the slot (S_NSKIP); a layer at or past P is not computed, but
+# everything the DMA queue counts still happens: a far layer's taps are waited for and copied (fwait,
+# fcopy) and every layer bumps EVENTS, so the queue, its thresholds and its buffers run as for 23.
+LAYER_PATCHES = [
+    ("""      IF NE JUMP n_lskip;               // (their loop counts and pointers come from the row)
+""", """      IF NE JUMP n_lskip;               // (their loop counts and pointers come from the row)
+      R0 = DM(T_LW, I4);                // S_LW + this layer's index
+      R1 = DM(S_NSKIP, I6);             // + the layers the capture leaves empty
+      R0 = R0 + R1;
+      R1 = S_LW + NLAYERS;
+      COMP(R0, R1);
+      IF GE JUMP n_skip;                // at or past its last layer: not computed
+"""),
+    ("""n_ddr:
+      CALL fwait;
+      CALL fcopy;
+""", """n_skip:                                 // an empty layer: nothing computed. A far one's taps are
+      R0 = DM(T_FAR, I4);               // never fetched (pump marks the job done), but fwait still
+      R0 = PASS R0;                     // waits for the queue to pass it (the jobs before it, the
+      IF EQ JUMP n_lev;                 // last group's write-back from OUTBUF included, ended), and
+      CALL fwait;                       // fcopy still fills OUTBUF and the write address and counts
+      CALL fcopy;                       // its event (a group with a computed layer still writes back)
+      JUMP n_lev;
+n_ddr:
+      CALL fwait;
+      CALL fcopy;
+"""),
+    ("""      I4 = R15;
+      L0 = 0;
+      L1 = 0;
+      L2 = 0;
+""", """      I4 = R15;
+n_lev:
+      L0 = 0;
+      L1 = 0;
+      L2 = 0;
+"""),
+    ("""    R0 = R0 + 1;
+    DM(J_NEXT) = R0;
+    R0 = 1;
+    DM(J_BUSY) = R0;
+""", """    R0 = R0 + 1;
+    DM(J_NEXT) = R0;
+    R1 = DM(J_TYPE, I5);                // a far layer's taps (0) or a group's write-back (1),
+    R1 = R1 - 1;                        // from an empty layer on: done, never run (the queue's
+    IF GT JUMP p_run;                   // order and J_DONE as if it had run)
+    I3 = DM(J_ROW, I5);
+    R1 = DM(T_LW, I3);
+    R2 = DM(S_NSKIP, I6);
+    R1 = R1 + R2;
+    R2 = S_LW + NLAYERS;
+    COMP(R1, R2);
+    IF LT JUMP p_run;
+    R1 = DM(J_DONE);
+    R1 = R1 + 1;
+    DM(J_DONE) = R1;
+    JUMP p_next;
+p_run:
+    R0 = 1;
+    DM(J_BUSY) = R0;
+"""),
+    ("""    DM(S_TRIM, I6) = F0;
+""", """    DM(S_TRIM, I6) = F0;
+    CALL ld_layers;                     // word 7: the capture's layer count
+"""),
+    ("""    DM(S_FRESH, I6) = R1;               // no tail: nothing played before
+""", """    DM(S_FRESH, I6) = R1;               // no tail: nothing played before
+    DM(S_NSKIP, I6) = R0;               // all layers until a model loads
+"""),
+    # the block's limit: a capture with more layers than its block's P_LIM (a constant its model's
+    # graph sets at creation, pid P_LIM; 0: none) is refused as no capture (silence), so a block
+    # never runs above the DSP cost its model declares
+    ("""    F2 = DM(-4, I3);
+    F3 = 1.8271484375;                  // 1871 / 1024
+    COMP(F2, F3);
+    IF NE JUMP n_none;
+""", """    F2 = DM(-4, I3);
+    F3 = 1.8271484375;                  // 1871 / 1024
+    COMP(F2, F3);
+    IF NE JUMP n_none;
+    F2 = DM(-7, I3);                    // the capture's layers: word 7 x 32 (0: all 23)
+    F3 = 32.0;
+    F2 = F2 * F3;
+    R2 = FIX F2;
+    R3 = NLAYERS;
+    R2 = PASS R2;
+    IF LE R2 = PASS R3;
+    R0 = DM(P_LIM, I0);                 // the block's limit, LIM_TAG | n; anything else (the
+    R3 = LIM_TAG;                       // instance's memory is not cleared): none
+    R0 = R0 XOR R3;
+    R3 = 0xFF;
+    COMPU(R0, R3);
+    IF GT JUMP n_lok;
+    COMP(R2, R0);
+    IF GT JUMP n_none;                  // more layers than the block runs
+n_lok:
+"""),
+]
+P_LIM = 16                              # the instance word (pid) of the block's layer limit
+LIM_TAG = 0x4E4C0000                    # its value: LIM_TAG | the most layers the block runs
+LAYER_SUB = """
+// IR word 7 (I3 = the slot's top word): the capture's layer count P / 32; 0 in older IRs. The slot keeps
+// 23 - P, 0 (all layers) for 0 or for anything outside 1..23. Uses R0-R2, F0, F1.
+ld_layers:
+    F0 = DM(-7, I3);
+    F1 = 32.0;
+    F0 = F0 * F1;
+    R0 = FIX F0;
+    R1 = NLAYERS;
+    R2 = R1 - R0;
+    R0 = PASS R0;
+    IF LE R2 = R2 - R2;
+    R2 = PASS R2;
+    IF LT R2 = R2 - R2;
+    DM(S_NSKIP, I6) = R2;
+    RTS;
+"""
+
+
 def kernel_src():
     src = nf.kernel_src()
     if WB == "sb":                       # the newest taps stay in SB (tap K-1); the write-back reads them there
@@ -274,6 +396,13 @@ def kernel_src():
         a = "\nlwait:\n"
         assert src.count(a) == 1
         src = src.replace(a, MP_SUB + a)
+    if LAYERS:
+        for a, b in LAYER_PATCHES:
+            assert src.count(a) == 1, a[:70]
+            src = src.replace(a, b)
+        a = "\nlwait:\n"
+        assert src.count(a) == 1
+        src = src.replace(a, LAYER_SUB + a)
     if P9_SHARE and not KEEP_POLLS:      # room for it: the wait-poll count (REP R_POLLS /
         n = src.count(POLL_INC)          # R_MAXPOLLS) only fed the simulator's bench and the meters
         src = src.replace(POLL_INC, "")
@@ -547,6 +676,9 @@ mpump:
 # 6c + t = tap t of channel c (t = 5: the next window, overwritten by fcopy), + a 1-word tap-list
 # sentinel. 192 -> 24 TCBs a call for the tap jobs.
 GATHER = os.environ.get("NAM_GATHER") == "1"
+LAYERS = os.environ.get("NAM_LAYERS") == "1"
+if LAYERS and not GATHER:
+    raise ValueError("NAM_LAYERS requires NAM_GATHER=1 for the experimental kernel")
 PRB_WORDS = 0                       # (nam_floor5t: the tap-list probe's buffer)
 TLEN = 0x200
 GTCB = 8
@@ -685,7 +817,7 @@ p_w:""")
 def names():
     return nf.names() + ["HFLAG", "HDR_RECH", "T_NXN", "T_NXO", "T_NXB", "T_NXR", "W_OFF", "HDR", "SIL_N",
                          "N_WEIGHTS", "LBROW0", "LBSUM", "LBF0", "LBF1", "DIAG", "DCNT", "DCAUSE", "FT_SIZE",
-                         "S_PMB", "INST_DM_SPAN", "INST_PM_SPAN"] + \
+                         "S_PMB", "INST_DM_SPAN", "INST_PM_SPAN"] + (["S_NSKIP", "P_LIM", "LIM_TAG"] if LAYERS else []) + \
         (["MSKD"] if P9_SHARE and P9_MODE != "nomask" else []) + (["MPS", "MP_INNER", "MP_OUTER"] if MID_PUMP else []) +         (["TLEN", "GTCB"] if GATHER else [])
 
 
@@ -801,6 +933,8 @@ class Layout(n2.Layout):
         self.nrp = len(near) + 1
         o = self.s_rp + self.nrp
         o += o & 1
+        self.s_nskip = o                 # (LAYERS) how many trailing layers the slot's capture leaves empty
+        o += 2 if LAYERS else 0
         self.slot_size = o
         self.near_at, off = {}, {1: 0, 2: 0}
         for sel, layers in ((1, nf.DM_LAYERS), (2, nf.PM_LAYERS)):
@@ -889,6 +1023,7 @@ class Layout(n2.Layout):
                  **({"MPS": alloc["MPS"], "MP_INNER": 8 // MID_PUMP, "MP_OUTER": MID_PUMP} if MID_PUMP else {}),
                  **({"TLEN": TLEN, "GTCB": GTCB} if GATHER else {}),
                  **({"PRB": alloc["PRB"]} if PRB_WORDS else {}))
+        v["S_NSKIP"], v["P_LIM"], v["LIM_TAG"] = self.s_nskip, P_LIM, LIM_TAG
         self.v = v
         self.b3_to = None
 

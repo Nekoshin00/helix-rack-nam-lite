@@ -24,6 +24,8 @@ def main():
     argv = sys.argv[1:]
     if not argv:
         sys.exit(__doc__)
+    if os.environ.get("NAM_LAYERS") == "1":
+        sys.exit("NAM_LAYERS is experimental and not supported by the firmware build yet.")
     stock = os.path.abspath(argv[0])
     got = hashlib.md5(open(stock, "rb").read()).hexdigest()
     assert got == STOCK_MD5, f"MD5 {got} is not the stock Helix Rack 3.80.0 file"

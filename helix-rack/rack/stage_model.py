@@ -16,6 +16,7 @@ Upstream's patch_amp functions do the work, with the Floor's numbers:
 usage: stage_model.py <in.l6ia> <out.l6ia>
 """
 import inspect
+from functools import partial
 import struct
 import sys
 
@@ -73,6 +74,64 @@ pa.nam_host_member = nam_host_member
 add_model_entry3 = _floor_copy(pa.add_model_entry3)
 add_model_entry4 = _floor_copy(pa.add_model_entry4)
 
+LIGHT_MODELS = (
+    ('HD2_AmpNAMLite', 'NAM A2 Lite', 23),
+    ('HD2_AmpNAMLite20', 'NAM Lite 20', 20),
+    ('HD2_AmpNAMLite16', 'NAM Lite 16', 16),
+    ('HD2_AmpNAMLite14', 'NAM Lite 14', 14),
+)
+
+
+def nam_host_blob_with_limit(comp_id, params, pid, value):
+    """Create the upstream host blob with one additional member initialization."""
+    n = len(params)
+    m = 2 * n + 1
+    a_off = 0x18
+    data_off = a_off + 20 * n
+    c_off = data_off + 3 * n
+    d_off = c_off + 4 * n
+    e_off = d_off + 4 * n
+    end = e_off + 4 * n
+    pm = [a_off, 0, c_off, 0, c_off, 0, d_off, 0, e_off, 0, end, 0]
+    pm += [5 * n, 2 * n, 3 * n, 3 * n, n, n]
+    pm += [2 * n, 0, n, n, n, 0]
+    for k, p in enumerate(params):
+        pm += [data_off, 0, k, p['op'], 1, 2, 0, 0, 1, 0]
+    for k in range(n):
+        pm += [data_off + 3 * k, 0, n + k, 1, 0, 3, 3, 3, 0, 0]
+    for p in params:
+        pm += [0x0e, p['pid'], 1]
+    for k in range(n):
+        pm += [k, n + k, 0, 0]
+    for k, p in sorted(enumerate(params), key=lambda kp: kp[1]['slot']):
+        pm += [k, k, p['slot'], 0]
+    for k in range(n):
+        pm += [k, k, k, 0]
+    assert len(pm) == end
+    v0 = 0x10
+    tree = v0 + 2 * m
+    pmo = tree + 4
+    pin = pmo + len(pm)
+    ini = pin + 4 * m
+    sub = ini + 2 * (n + m)
+    b = [3, 2, tree, 1, ini, n + m, pmo, len(pm), sub, 0, pin, m]
+    b += [1, 0, 1, 2]
+    for p in params + params:
+        b += [1, p['default_word']]
+    b += [1, value, 0, comp_id, 0, 0]
+    b += pm
+    for k, p in enumerate(params):
+        b += [0x0c, p['slot'], v0 + 2 * k, 1]
+    for k, p in enumerate(params):
+        b += [0x0e, p['pid'], v0 + 2 * (n + k), 2]
+    b += [0x0e, pid, v0 + 4 * n, 2]
+    for k in range(n):
+        b += [1, pmo + data_off + 3 * k]
+    for k in range(m):
+        b += [1, pin + 4 * k]
+    assert len(b) == sub
+    return b
+
 
 def expand_blob0(e2_raw):
     H = halfwords(e2_raw)
@@ -93,6 +152,10 @@ def expand_blob0(e2_raw):
 
 def main():
     src, out = sys.argv[1], sys.argv[2]
+    light = os.environ.get("NAM_LAYERS") == "1"
+    if light and (not getattr(nam_rack, "LAYERS", False) or os.environ.get("NAM_555")
+                  or os.environ.get("NAM_555_VARIANT")):
+        raise SystemExit("NAM_LAYERS requires the layer-aware kernel and cannot be combined with NAM_555 variants.")
     data, _ = pa.load_l6ia_from_any(src)
     ents = l6ia.parse(data)
     e_db = pa.get_entry_swapped(data, E_DB)
@@ -105,11 +168,23 @@ def main():
         nam = spec555.nam_params(e_db, info)
     else:
         nam = pa.nam_params(e_db, info)
-    new_gl, blob_idx, comp = add_model_entry4(e_gl, clarity['blob_index'], nam, SDRAM_WORDS)
     # 555 "fx" variant: the model DB record (category distortion, its group lists) is Xenomorph's, as
     # upstream's add-fx-model; the composite stays Clarity's copy (amp-size instance memory)
     db_src = pa.find_model(info, 'HD2_DistXenomorphFuzzMono') if os.environ.get("NAM_555_VARIANT") == "fx" else clarity
-    new_db, model_id, lists = add_model_entry3(e_db, db_src, 'HD2_AmpNAMLite', 'NAM A2 Lite', blob_idx, nam)
+    new_gl, new_db = e_gl, e_db
+    models = LIGHT_MODELS if light else LIGHT_MODELS[:1]
+    added = []
+    original_blob = pa.nam_host_blob
+    try:
+        for name, display, limit in models:
+            if light:
+                pa.nam_host_blob = partial(
+                    nam_host_blob_with_limit, pid=nam_rack.P_LIM, value=nam_rack.LIM_TAG | limit)
+            new_gl, blob_idx, comp = add_model_entry4(new_gl, clarity['blob_index'], nam, SDRAM_WORDS)
+            new_db, model_id, lists = add_model_entry3(new_db, db_src, name, display, blob_idx, nam)
+            added.append((display, model_id, blob_idx, comp, limit))
+    finally:
+        pa.nam_host_blob = original_blob
     e2 = data[ents[E_E2]['payload_off']: ents[E_E2]['payload_off'] + ents[E_E2]['payload_len']]
     new_e2, rep = expand_blob0(e2)
     # checks: the new Blob 0 as the SHARC would relocate it, and the new model as parsed back
@@ -119,14 +194,17 @@ def main():
     err = pa.sharc_blob0_check(b0, BLOB0_CAP)
     assert err is None, err
     chk = pa.parse_entry3_full(new_db)
-    assert len(chk['models']) == N_MODELS + 1 and chk['models'][-1]['name'] == 'HD2_AmpNAMLite'
+    assert len(chk['models']) == N_MODELS + len(models)
+    assert [m['name'] for m in chk['models'][N_MODELS:]] == [name for name, _, _ in models]
     assert all(a['words'] == b['words'] or a['off'] != b['off'] or True for a, b in zip(info['models'], chk['models']))
     assert [(a['name'], a['model_id'], a['blob_index']) for a in info['models']] == \
         [(a['name'], a['model_id'], a['blob_index']) for a in chk['models'][:N_MODELS]], "a stock model changed"
     img, _, _ = l6ia.rebuild_archive(data, {E_E2: l6ia.swap32(new_e2), E_DB: new_db, E_GL: new_gl})
     open(out, 'wb').write(img)
-    print(f"model DB: 'NAM A2 Lite' = model {model_id} on blob {blob_idx}, in browser groups {lists}")
-    print(f"graph library: host composite {comp:#x} (a copy of 0x6001aa), member 1 = primitive {HOOK_ID:#x}; "
+    for display, model_id, blob_idx, comp, limit in added:
+        print(f"model DB: '{display}' = model {model_id} on blob {blob_idx}, host {comp:#x}" +
+              (f", layer limit {limit}" if light else f", in browser groups {lists}"))
+    print(f"graph library: member 1 = primitive {HOOK_ID:#x}; "
           f"Blob 0 {BLOB0_STOCK:#x} -> {len(b0):#x} words (cap {BLOB0_CAP:#x}), SHARC relocation check OK")
     for line in rep:
         print(line)

@@ -71,3 +71,64 @@ ha establecido si afectan al Rack. No distribuir firmware original ni modificado
 - KernelCheck pasó en el build con umbral de velocidad relajado a 60.000 instrucciones:
   no es una medición de tiempo real del Rack. Pasaron también las pruebas simuladas de DMA
   atascado y recuperación; no prueban el hardware ni los manejadores originales.
+
+## Capturas ligeras (trabajo en curso)
+- El conversor puede escribir el número de capas con `--layers`; el firmware instalado
+  procesa todas las capas y no obtiene ahorro de DSP.
+- El kernel experimental adapta la lógica del LT y se prueba con
+  `python tests\check_light_kernel.py`. No está habilitado en el build normal.
+- En el simulador, 23, 20, 16 y 14 capas coincidieron con la referencia.
+  La media fue de 35.700, 33.008, 29.722 y 27.588 instrucciones simuladas,
+  respectivamente; estos valores no miden ciclos ni carga DSP real.
+- `tests\check_light_transitions.py` pasó con modelos de distintas capas,
+  cambios entre capturas, múltiples instancias, reemplazo de captura y
+  recuperación simulada ante DMA bloqueado y canal ocupado. No valida el
+  controlador DMA del Rack.
+- `tests\check_light_dma_abort.py` comprobó 14 y 23 capas con estado DMA
+  ocupado tras la desactivación: liberación tras 5 o 999 sondeos y sin
+  liberación. La prueba verifica el aplazamiento de limpieza y la recuperación
+  simulada; no reproduce interrupciones ni el controlador original.
+- `tests\check_light_memory.py` comprobó los extremos y direcciones vecinas
+  de DM y PM con rangos de prueba, y el tamaño mínimo y un tamaño insuficiente
+  de SDRAM. La SDRAM insuficiente conserva el comportamiento existente de
+  dejar pasar la señal; estas pruebas no verifican la memoria dinámica real.
+- `tests\check_light_limit_changes.py` pasó al cambiar o reemplazar una captura
+  por otra que excede el límite y después volver a una válida. En la transición
+  el simulador produce la cola del modelo anterior y del ecualizador;
+  la prueba compara esa salida con la referencia en vez de exigir silencio
+  instantáneo.
+- La etapa de modelos experimental genera cuatro grafos con límites de
+  23, 20, 16 y 14 capas. Sus entradas y límites se revisaron en una imagen
+  intermedia offline. Las tablas ARM y el navegador se integraron y verificaron
+  offline con IDs de preset 380, 382, 516 y 572; el 380 sigue siendo el del
+  modelo original. Los títulos IR se probaron en el intérprete ARM.
+- La imagen L6IA experimental completa pasó `l6ia_verify`; Entry 2 conservó
+  4.180 bytes de espacio y el cave ARM 6.408 bytes. Esto no demuestra que
+  las ubicaciones sean seguras en ejecución real.
+- Los cuatro modelos declaran provisionalmente el coste 3600 del build
+  anterior. No está medido en Rack ni garantiza que no se sobrecargue el DSP.
+- La entrada ARM normal y las variantes 555 se compararon byte a byte con
+  la implementación anterior. La entrada ARM normal también coincide con
+  la de la imagen instalada.
+- El build normal se volvió a generar y coincidió byte a byte con la imagen
+  instalada (SHA-256 `bc461c4244fdc0e78caac61a07597f1fff216a9786d6f4a87f7ec23a4d10ec21`).
+- En una construcción offline de la etapa DSP, Entry 2 conservó 4.180 bytes de espacio.
+  La distribución simulada dejó 5 palabras libres en R1, 5 en R3 y 87 en R2;
+  esto no demuestra que esas regiones sean seguras en ejecución real.
+- Se generó la primera prueba por etapas, `Rack_light_test1_seg0_only.hxf`:
+  aumenta seg0 en 46.752 bytes de ceros; el resto de las entradas conserva el
+  firmware original. La imagen no contiene NAM ni el kernel ligero. Integridad
+  y contenido verificados offline; **no se ha instalado ni probado en Rack**.
+  SHA-256 `0d94d69011b12fb57f45ddc9412efc1f71a9f829f5e12c57537afde9f3cde124`.
+  Respaldar presets y User IR antes de instalar; no cargar ni guardar presets
+  con NAM mientras esta imagen esté instalada.
+- Se generó por separado `Rack_light_full_EXPERIMENTAL.hxf` con las cuatro
+  variantes y el kernel ligero, sin modificar el build normal. Pasaron
+  KernelCheck, la revisión de la interfaz, las pruebas ARM y `l6ia_verify`;
+  el HXF empaquetado se desempaquetó y coincidió con el L6IA verificado.
+  SHA-256 `4600f42ca70efe239534f38a5254de8a908890a96cf51a5f8788a221b31fe331`.
+  La instalé en el Rack y reporté que todo funciona (2026-11-13). El
+  reporte no incluye mediciones de carga DSP ni estabilidad prolongada.
+- Faltan pruebas adicionales de fallos y memoria, validación en hardware por
+  etapas y la medición del uso real de DSP en Rack.
+  Las mediciones y los costes del LT no deben darse por válidos para Rack.

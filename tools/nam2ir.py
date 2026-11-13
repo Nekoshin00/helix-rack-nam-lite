@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """nam2ir.py - a NAM A2 Lite model (3 channels) as an HX Stomp User IR, for NAM A2 Lite.
 
-usage: nam2ir.py <model.nam> -o model.wav [--no-level]
+usage: nam2ir.py <model.nam> -o model.wav [--no-level] [--layers]
 
 A capture that gives its interface's level (metadata input_level_dbu, the dBu
 at 0 dBFS) has it in IR word 5 (nam_lite.level_word); the kernel then trims
@@ -9,13 +9,17 @@ its input by STOMP_DBU - input_level_dbu (nam_lite.py), so that at Input 5.0
 the Stomp's input meets the model as the capture's interface did. --no-level
 leaves word 5 at 0 (no trim).
 
+--layers stores the number of active leading layers in word 7, as in the
+Helix LT layer-aware format. This alone does not reduce DSP usage: the
+installed Rack kernel does not skip layers.
+
 Writes a 2,048-sample, 48 kHz, mono, 32-bit float .wav. Import it into a User
 IR slot (1..128) with HX Edit and set NAM A2 Lite's Model knob to that slot's
 number. A .nam holding several sizes (a SlimmableContainer) gives its 3-channel
 A2 Lite one. web/index.html does the same in a browser.
 
 The layout is tools/sharc/nam_lite.py's
-ir_samples(): 0.5, -0.5, 3.0, a scale 2^e, 1871 / 1024, 0, 0, 0, then the model's
+ir_samples(): 0.5, -0.5, 3.0, a scale 2^e, 1871 / 1024, level, 0, layers, then the model's
 1,871 weights in the order the kernel loads them, then its silence state (72
 words, each / 16: what the rings hold after silence, so a change of model does
 not pop), all divided by 2^e (exact). A file made before the silence state has
@@ -82,7 +86,7 @@ def main():
     if len(argv) < 3 or "-o" not in argv:
         sys.exit(__doc__)
     out = argv.pop(argv.index("-o") + 1)
-    src = [a for a in argv if a not in ("-o", "--no-level")][0]
+    src = [a for a in argv if a not in ("-o", "--no-level", "--layers")][0]
     w, c = nam_pack.load(src, channels=nam_lite.C)
     if c != nam_lite.C:
         sys.exit(f"{src}: {c} channels; NAM A2 Lite takes the 3-channel A2 Lite model")
@@ -91,7 +95,7 @@ def main():
         sys.exit(f"{src}: not an A2 Lite capture the kernel can run: " + "; ".join(bad))
     dbu = None if "--no-level" in argv else nam_pack.input_level_dbu(src)
     try:
-        words = nam_lite.ir_samples(w, dbu)
+        words = nam_lite.ir_samples(w, dbu, include_layer_count="--layers" in argv)
     except ValueError as e:
         sys.exit(f"{src}: {e}")
     write_wav(out, words)
@@ -100,6 +104,9 @@ def main():
           f"({nam_lite.STOMP_DBU:g} dBu at 0 dBFS)" if dbu is not None
           else "input level none: the capture gives no input_level_dbu" if "--no-level" not in argv
           else "input level left out (--no-level)")
+    if "--layers" in argv:
+        layers = nam_lite.layer_count(w)
+        print(f"active leading layers: {layers}; the current Rack firmware does not skip layers")
     print(f"wrote {out}: 2048 samples, 48 kHz float, 1,871 weights (scale {scale:g}); "
           f"HX Edit: import into a User IR slot, then set NAM A2 Lite's Model knob to that slot")
 
